@@ -1,23 +1,47 @@
 #ifndef STACK_H
 #define STACK_H
 
+#include <string>
+#include <vector>
+
+#include "ShelterCapacityTracker.h"
+
+struct OperationRecord
+{
+    int requestId;
+    std::string village;
+    int people;
+    int priority;
+    std::vector<ShelterAssignment> assignments;
+};
+
 class Stack
 {
 private:
+    struct Node
+    {
+        OperationRecord operation;
+        Node *next;
 
-    int data[50];
+        explicit Node(const OperationRecord &value) : operation(value), next(NULL) {}
+    };
 
-    int top;
+    Node *topNode;
 
 public:
-
     Stack();
+    ~Stack();
 
-    void push(int x);
+    Stack(const Stack &) = delete;
+    Stack &operator=(const Stack &) = delete;
 
-    int pop();
+    void push(const OperationRecord &operation);
+    void push(int requestId);
+    bool pop(OperationRecord &operation);
+    bool top(OperationRecord &operation) const;
 
-    bool isEmpty();
+    bool isEmpty() const;
+    std::vector<OperationRecord> getAll() const;
 
     void display();
 };

@@ -3,69 +3,98 @@
 
 using namespace std;
 
-
 Stack::Stack()
 {
-    top = -1;
+    topNode = NULL;
 }
 
-
-void Stack::push(int x)
+Stack::~Stack()
 {
-    if(top == 49)
+    while (topNode != NULL)
     {
-        cout << "Stack is full.\n";
-        return;
+        Node *next = topNode->next;
+        delete topNode;
+        topNode = next;
+    }
+}
+
+void Stack::push(const OperationRecord &operation)
+{
+    Node *node = new Node(operation);
+    node->next = topNode;
+    topNode = node;
+}
+
+void Stack::push(int requestId)
+{
+    OperationRecord operation;
+    operation.requestId = requestId;
+    operation.people = 0;
+    operation.priority = 0;
+    push(operation);
+}
+
+bool Stack::pop(OperationRecord &operation)
+{
+    if (isEmpty())
+    {
+        return false;
     }
 
-    top++;
-
-    data[top] = x;
+    Node *node = topNode;
+    operation = node->operation;
+    topNode = node->next;
+    delete node;
+    return true;
 }
 
-
-int Stack::pop()
+bool Stack::top(OperationRecord &operation) const
 {
-    if(isEmpty())
+    if (isEmpty())
     {
-        return -1;
+        return false;
     }
-
-    int x = data[top];
-
-    top--;
-
-    return x;
+    operation = topNode->operation;
+    return true;
 }
 
-
-bool Stack::isEmpty()
+bool Stack::isEmpty() const
 {
-    if(top == -1)
-    {
-        return true;
-    }
-
-    return false;
+    return topNode == NULL;
 }
 
+std::vector<OperationRecord> Stack::getAll() const
+{
+    std::vector<OperationRecord> operations;
+    for (const Node *node = topNode; node != NULL; node = node->next)
+    {
+        operations.push_back(node->operation);
+    }
+    return operations;
+}
 
 void Stack::display()
 {
-    if(isEmpty())
+    if (isEmpty())
     {
         cout << "History is empty.\n";
         return;
     }
 
-
-    cout << "\nProcessed Request History:\n";
-
-
-    for(int i = top; i >= 0; i--)
+    cout << "\nProcessed Relief Operation History (newest first):\n";
+    for (const Node *node = topNode; node != NULL; node = node->next)
     {
-        cout << "Request ID: "
-             << data[i]
-             << endl;
+        cout << "Request ID: " << node->operation.requestId;
+        if (!node->operation.village.empty())
+        {
+            cout << "  Village: " << node->operation.village
+                 << "  Evacuees: " << node->operation.people;
+            for (std::size_t i = 0; i < node->operation.assignments.size(); ++i)
+            {
+                cout << "\n  " << node->operation.assignments[i].shelterName
+                     << ": " << node->operation.assignments[i].evacuees;
+            }
+        }
+        cout << endl;
     }
 }
