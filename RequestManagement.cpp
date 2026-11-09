@@ -22,7 +22,11 @@ void requestMenu()
         cout << "3. Process Next Request\n";
         cout << "4. Display Emergency Requests\n";
         cout << "5. Display Normal Requests\n";
-        cout << "6. Exit Request Module\n";
+        cout << "6. Display Processed History\n";
+        cout << "7. Add Shelter\n";
+        cout << "8. Display Shelter Capacities\n";
+        cout << "9. Release Evacuees\n";
+        cout << "10. Exit Request Module\n";
 
         cout << "\nEnter choice: ";
         cin >> choice;
@@ -50,6 +54,37 @@ void requestMenu()
                 break;
 
             case 6:
+                manager.displayHistory();
+                break;
+
+            case 7:
+                manager.addShelter();
+                break;
+
+            case 8:
+                manager.displayShelters();
+                break;
+
+            case 9:
+            {
+                int requestId;
+                int evacuees;
+                cout << "\nProcessed request ID: ";
+                cin >> requestId;
+                cout << "Number of evacuees to release: ";
+                cin >> evacuees;
+                if (manager.releaseEvacuees(requestId, evacuees))
+                {
+                    cout << "\nShelter capacity released.\n";
+                }
+                else
+                {
+                    cout << "\nNo matching allocation for that release amount.\n";
+                }
+                break;
+            }
+
+            case 10:
                 cout << "\nReturning to Main Menu...\n";
                 break;
 
@@ -57,7 +92,7 @@ void requestMenu()
                 cout << "\nInvalid choice.\n";
         }
 
-    } while(choice != 6);
+    } while(choice != 10);
 }
 
 
@@ -88,12 +123,14 @@ void RequestManagement::addEmergencyRequest()
     cin >> people;
 
 
-    activeRequests.addRequest(
-        nextID,
-        village,
-        people,
-        1
-    );
+    if (people <= 0 ||
+        !requestsById.insert(ReliefRequest{nextID, village, people, 1}))
+    {
+        cout << "\nEnter a positive affected-person count.\n";
+        return;
+    }
+
+    activeRequests.addRequest(nextID, village, people, 1);
 
 
     /*
@@ -138,12 +175,14 @@ void RequestManagement::addNormalRequest()
     cin >> people;
 
 
-    activeRequests.addRequest(
-        nextID,
-        village,
-        people,
-        0
-    );
+    if (people <= 0 ||
+        !requestsById.insert(ReliefRequest{nextID, village, people, 0}))
+    {
+        cout << "\nEnter a positive affected-person count.\n";
+        return;
+    }
+
+    activeRequests.addRequest(nextID, village, people, 0);
 
 
     normalRequests.enqueue(nextID);
@@ -169,8 +208,7 @@ void RequestManagement::displayActiveRequests()
 void RequestManagement::processNextRequest()
 {
     int id;
-
-    RequestNode *request;
+    const bool emergency = !emergencyRequests.isEmpty();
 
 
     cout << "\n";
@@ -183,16 +221,16 @@ void RequestManagement::processNextRequest()
        Emergency requests are processed first.
     */
 
-    if(!emergencyRequests.isEmpty())
+    if(emergency)
     {
-        id = emergencyRequests.remove();
+        id = emergencyRequests.peek();
 
         cout << "\nEmergency request selected.\n";
     }
 
     else if(!normalRequests.isEmpty())
     {
-        id = normalRequests.dequeue();
+        id = normalRequests.peek();
 
         cout << "\nNormal request selected.\n";
     }
@@ -205,11 +243,26 @@ void RequestManagement::processNextRequest()
     }
 
 
-    request = activeRequests.findRequest(id);
-
+    const ReliefRequest *request = requestsById.find(id);
 
     if(request != NULL)
     {
+        vector<ShelterAssignment> assignments;
+        if (!shelterTracker.allocate(id, request->village, request->people, assignments))
+        {
+            cout << "\nInsufficient shelter capacity. The request remains queued.\n";
+            return;
+        }
+
+        if(emergency)
+        {
+            emergencyRequests.remove();
+        }
+        else
+        {
+            normalRequests.dequeue();
+        }
+
         cout << "\n";
         cout << "Request ID      : "
              << request->id << endl;
@@ -238,7 +291,20 @@ void RequestManagement::processNextRequest()
            Add request to history.
         */
 
-        history.push(id);
+        OperationRecord operation;
+        operation.requestId = id;
+        operation.village = request->village;
+        operation.people = request->people;
+        operation.priority = request->priority;
+        operation.assignments = assignments;
+        history.push(operation);
+
+        cout << "Shelter Assignments:\n";
+        for (size_t i = 0; i < assignments.size(); ++i)
+        {
+            cout << "  " << assignments[i].shelterName << ": "
+                 << assignments[i].evacuees << " evacuees\n";
+        }
 
 
         /*
@@ -247,6 +313,7 @@ void RequestManagement::processNextRequest()
         */
 
         activeRequests.deleteRequest(id);
+        requestsById.erase(id);
 
 
         cout << "\nRequest processed successfully.\n";
@@ -257,6 +324,53 @@ void RequestManagement::processNextRequest()
 void RequestManagement::displayHistory()
 {
     history.display();
+}
+
+void RequestManagement::addShelter()
+{
+    string name;
+    int capacity;
+
+    cout << "\nShelter name: ";
+    cin >> name;
+    cout << "Shelter capacity: ";
+    cin >> capacity;
+
+    if (registerShelter(name, capacity))
+    {
+        cout << "\nShelter registered.\n";
+    }
+    else
+    {
+        cout << "\nShelter name must be unique and capacity must be positive.\n";
+    }
+}
+
+bool RequestManagement::registerShelter(const string &name, int capacity)
+{
+    return shelterTracker.addShelter(name, capacity);
+}
+
+bool RequestManagement::releaseEvacuees(int requestId, int evacuees)
+{
+    return shelterTracker.release(requestId, evacuees);
+}
+
+void RequestManagement::displayShelters()
+{
+    const vector<ShelterCapacity> shelters = shelterTracker.getShelters();
+    if (shelters.empty())
+    {
+        cout << "\nNo shelters registered.\n";
+        return;
+    }
+
+    cout << "\nShelter Capacity:\n";
+    for (size_t i = 0; i < shelters.size(); ++i)
+    {
+        cout << shelters[i].name << ": " << shelters[i].occupied
+             << "/" << shelters[i].capacity << " occupied\n";
+    }
 }
 
 

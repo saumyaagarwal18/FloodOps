@@ -7,6 +7,8 @@
 #include "PriorityQueue.h"
 #include "LinkedList.h"
 #include "Stack.h"
+#include "RequestHashTable.h"
+#include "ShelterCapacityTracker.h"
 
 void requestMenu();
 using namespace std;
@@ -23,6 +25,10 @@ private:
     LinkedList activeRequests;
 
     Stack history;
+
+    RequestHashTable requestsById;
+
+    ShelterCapacityTracker shelterTracker;
 
     int nextID;
 
@@ -43,6 +49,14 @@ public:
 
 
     void displayHistory();
+
+    void addShelter();
+
+    void displayShelters();
+
+    bool registerShelter(const string &name, int capacity);
+
+    bool releaseEvacuees(int requestId, int evacuees);
 
 
     void displayEmergencyRequests();
