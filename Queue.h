@@ -18,7 +18,9 @@ public:
 
     int dequeue();
 
-    bool isEmpty();
+    int peek() const;
+
+    bool isEmpty() const;
 
     void display();
 };

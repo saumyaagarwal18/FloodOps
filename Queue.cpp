@@ -51,8 +51,18 @@ int Queue::dequeue()
     return x;
 }
 
+int Queue::peek() const
+{
+    if(isEmpty())
+    {
+        return -1;
+    }
 
-bool Queue::isEmpty()
+    return data[front];
+}
+
+
+bool Queue::isEmpty() const
 {
     if(front == -1)
     {

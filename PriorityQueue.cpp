@@ -65,8 +65,18 @@ int PriorityQueue::remove()
     return id;
 }
 
+int PriorityQueue::peek() const
+{
+    if(isEmpty())
+    {
+        return -1;
+    }
 
-bool PriorityQueue::isEmpty()
+    return data[0];
+}
+
+
+bool PriorityQueue::isEmpty() const
 {
     if(size == 0)
     {

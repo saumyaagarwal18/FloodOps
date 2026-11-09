@@ -19,7 +19,9 @@ public:
 
     int remove();
 
-    bool isEmpty();
+    int peek() const;
+
+    bool isEmpty() const;
 
     void display();
 };
