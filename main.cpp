@@ -1,17 +1,10 @@
 
-#if __has_include(<SFML/Graphics.hpp>)
-    #include <SFML/Graphics.hpp>
-#elif __has_include("/opt/homebrew/include/SFML/Graphics.hpp")
-    #include "/opt/homebrew/include/SFML/Graphics.hpp"
-#elif __has_include("/usr/local/include/SFML/Graphics.hpp")
-    #include "/usr/local/include/SFML/Graphics.hpp"
-#elif __has_include("/usr/include/SFML/Graphics.hpp")
-    #include "/usr/include/SFML/Graphics.hpp"
-#else
-    #error "SFML headers not found. Install SFML or add its include path."
-#endif
+#ifdef FLOODOPS_ENABLE_SFML
+
+#include <SFML/Graphics.hpp>
 
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <vector>
 #include <string>
@@ -24,6 +17,9 @@
 #include "PriorityQueue.h"
 #include "Queue.h"
 #include "RequestManagement.h"
+#include "RequestHashTable.h"
+#include "ShelterCapacityTracker.h"
+#include "Stack.h"
 
 // Access existing data structures from LocationManagement.cpp without editing it
 extern LocationNode *districtRoot;
@@ -32,34 +28,191 @@ extern int locationCount;
 extern int road[50][50];
 void addChild(LocationNode *parent, LocationNode *newNode);
 
-// UI State & Local Model for Requests
-struct VisualRequest {
-    int id;
-    std::string village;
-    int people;
-    int priority; // 1 = Emergency, 0 = Normal
-};
-
-std::vector<VisualRequest> activeRequests;
-int currentTab = 0; // 0: Graph Network, 1: Hierarchy Tree, 2: Requests
+RequestHashTable activeRequests;
+ShelterCapacityTracker shelterTracker;
+Stack operationHistory;
+int nextRequestId = 101;
+int currentTab = 0; // 0: Network, 1: Hierarchy, 2: Requests
 std::string bfsResultText = "Ready to coordinate relief.";
 sf::Color bfsResultColor = sf::Color(78, 111, 137);
 std::string locationNameInput;
-enum class DialogMode { None, AddLocation, ManageRoad, AddRequest, CheckRoute, ShowRoute };
+std::string shelterNameInput;
+std::string shelterCapacityInput;
+std::string requestLookupInput;
+enum class DialogMode {
+    None, AddLocation, ManageRoad, AddRequest, CheckRoute, ShowRoute,
+    AddShelter, ConnectRegions, LookupRequest, ReleaseShelter
+};
 DialogMode dialogMode = DialogMode::None;
 int roadSourceSelection = 0;
 int roadDestinationSelection = 1;
 int roadStatusSelection = 0;
 int requestLocationSelection = 0;
 int requestPrioritySelection = 1;
+int shelterRegionSelection = 0;
+int shelterInputFocus = 0;
 std::string requestPeopleInput;
 int routeSourceSelection = 0;
 int routeDestinationSelection = 1;
 std::vector<int> currentRoute;
 std::size_t routeScrollOffset = 0;
 
+std::vector<std::string> getReachableShelterRegions(const std::string &region) {
+    std::vector<std::string> reachableRegions;
+    int sourceIndex = findLocation(region);
+    if (sourceIndex < 0 && districtRoot != NULL) {
+        for (LocationNode *village = districtRoot->child;
+             village != NULL && sourceIndex < 0; village = village->sibling) {
+            for (LocationNode *area = village->child;
+                 area != NULL; area = area->sibling) {
+                if (area->name == region) {
+                    sourceIndex = findLocation(village->name);
+                    break;
+                }
+            }
+        }
+    }
+    if (sourceIndex < 0) {
+        return reachableRegions;
+    }
+
+    const std::vector<ShelterCapacity> shelters = shelterTracker.getShelters();
+    for (std::size_t i = 0; i < shelters.size(); ++i) {
+        const int shelterRegionIndex = findLocation(shelters[i].region);
+        if (shelterRegionIndex >= 0 &&
+            (shelterRegionIndex == sourceIndex ||
+             isReachable(sourceIndex, shelterRegionIndex))) {
+            reachableRegions.push_back(shelters[i].region);
+        }
+    }
+    return reachableRegions;
+}
+
+bool parseRequestId(const std::string &value, int &requestId) {
+    if (value.empty()) {
+        return false;
+    }
+
+    requestId = 0;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const char digit = value[i];
+        if (digit < '0' || digit > '9') {
+            return false;
+        }
+        const int numericDigit = digit - '0';
+        if (requestId > (std::numeric_limits<int>::max() - numericDigit) / 10) {
+            return false;
+        }
+        requestId = requestId * 10 + numericDigit;
+    }
+    return true;
+}
+
+void lookupPendingRequest() {
+    int requestId = 0;
+    if (!parseRequestId(requestLookupInput, requestId)) {
+        bfsResultText = "Enter a valid request ID.";
+        bfsResultColor = sf::Color(190, 68, 68);
+        return;
+    }
+
+    const ReliefRequest *request = activeRequests.find(requestId);
+    if (request != NULL) {
+        bfsResultText = "ID #" + std::to_string(request->id) + " [PENDING]: " +
+            request->village + ", " + std::to_string(request->people);
+        bfsResultColor = sf::Color(39, 126, 177);
+        return;
+    }
+
+    const std::vector<OperationRecord> operations = operationHistory.getAll();
+    for (std::size_t i = 0; i < operations.size(); ++i) {
+        if (operations[i].requestId == requestId) {
+            std::string shelterNames;
+            for (std::size_t j = 0; j < operations[i].assignments.size(); ++j) {
+                if (!shelterNames.empty()) {
+                    shelterNames += ", ";
+                }
+                shelterNames += operations[i].assignments[j].shelterName;
+            }
+            if (shelterNames.empty()) {
+                shelterNames = "Unknown shelter";
+            }
+
+            bfsResultText = "ID #" + std::to_string(operations[i].requestId) +
+                " [DISPATCHED]: " + operations[i].village + " -> " +
+                shelterNames;
+            bfsResultColor = sf::Color(39, 125, 91);
+            return;
+        }
+    }
+
+    bfsResultText = "Request #" + std::to_string(requestId) + " not found";
+    bfsResultColor = sf::Color(190, 68, 68);
+}
+
+bool addReliefRequest(const std::string &village, int people, int priority, int &id) {
+    ReliefRequest request{nextRequestId, village, people, priority};
+    if (!activeRequests.insert(request)) {
+        return false;
+    }
+
+    id = nextRequestId++;
+    return true;
+}
+
+bool dispatchNextRequest(std::string &message) {
+    const std::vector<ReliefRequest> requests = activeRequests.getAll();
+    if (requests.empty()) {
+        message = "No requests are waiting for dispatch.";
+        return false;
+    }
+
+    const ReliefRequest *nextRequest = &requests[0];
+    for (std::size_t i = 1; i < requests.size(); ++i) {
+        if (requests[i].priority > nextRequest->priority ||
+            (requests[i].priority == nextRequest->priority &&
+             requests[i].id < nextRequest->id)) {
+            nextRequest = &requests[i];
+        }
+    }
+
+    std::vector<ShelterAssignment> assignments;
+    const std::vector<std::string> reachableRegions =
+        getReachableShelterRegions(nextRequest->village);
+    if (!shelterTracker.allocate(nextRequest->id, nextRequest->village,
+                                 nextRequest->people, reachableRegions,
+                                 assignments)) {
+        message = "No reachable shelter capacity; request remains queued.";
+        return false;
+    }
+
+    OperationRecord operation;
+    operation.requestId = nextRequest->id;
+    operation.village = nextRequest->village;
+    operation.people = nextRequest->people;
+    operation.priority = nextRequest->priority;
+    operation.assignments = assignments;
+    operationHistory.push(operation);
+    const int dispatchedId = nextRequest->id;
+    activeRequests.erase(dispatchedId);
+
+    message = "Request #" + std::to_string(dispatchedId) + " assigned: ";
+    for (std::size_t i = 0; i < assignments.size(); ++i) {
+        if (i > 0) {
+            message += ", ";
+        }
+        message += assignments[i].shelterName + " (" +
+                   std::to_string(assignments[i].evacuees) + ")";
+    }
+    return true;
+}
+
 bool addVillageLocation(const std::string &name) {
     if (name.empty() || locationCount >= 50 || districtRoot == NULL) {
+        return false;
+    }
+
+    if (shelterTracker.findShelter(name) != NULL) {
         return false;
     }
 
@@ -74,6 +227,7 @@ bool addVillageLocation(const std::string &name) {
     }
 
     addChild(districtRoot, new LocationNode(name, "Village"));
+    //shelterTracker.addShelter(name, 500);
 
     const int newLocationIndex = locationCount++;
     locationNames[newLocationIndex] = name;
@@ -251,11 +405,14 @@ void seedDemoScenario() {
     road[3][4] = 2; road[4][3] = 2; // Vikasnagar <-> Sahaspur (Blocked)
     road[0][4] = 1; road[4][0] = 1; // Dehradun <-> Sahaspur (Open)
 
+    shelterTracker.addShelter("Dehradun Shelter", "Dehradun", 500);
+
     // 3. Populate Relief Requests
-    activeRequests.push_back({101, "Rishikesh", 450, 1});
-    activeRequests.push_back({102, "Sahaspur", 120, 0});
-    activeRequests.push_back({103, "Dakpathar", 310, 1});
-    activeRequests.push_back({104, "Baluwala", 80, 0});
+    int requestId = 0;
+    addReliefRequest("Rishikesh", 450, 1, requestId);
+    addReliefRequest("Sahaspur", 120, 0, requestId);
+    addReliefRequest("Dakpathar", 310, 1, requestId);
+    addReliefRequest("Baluwala", 80, 0, requestId);
 }
 
 int main() {
@@ -289,14 +446,15 @@ int main() {
     seedDemoScenario();
 
     const UiButton actionButtons[] = {
-        {765.0f, 158.0f, 230.0f, 46.0f, "Manage roads", "Connect locations; set open / blocked", sf::Color(42, 178, 155)},
-        {765.0f, 212.0f, 230.0f, 46.0f, "Check route with BFS", "Rishikesh to Sahaspur", sf::Color(71, 150, 224)},
-        {765.0f, 266.0f, 230.0f, 46.0f, "Create relief request", "Choose location, people and urgency", sf::Color(244, 174, 68)},
-        {765.0f, 320.0f, 230.0f, 46.0f, "Dispatch next request", "Emergency requests are prioritized", sf::Color(226, 111, 102)},
-        {765.0f, 374.0f, 230.0f, 46.0f, "Add location", "Register a new village", sf::Color(123, 113, 226)}
+        {765.0f, 154.0f, 230.0f, 40.0f, "Manage roads", "Connect locations; set open / blocked", sf::Color(42, 178, 155)},
+        {765.0f, 200.0f, 230.0f, 40.0f, "Check route with BFS", "Rishikesh to Sahaspur", sf::Color(71, 150, 224)},
+        {765.0f, 246.0f, 230.0f, 40.0f, "Create relief request", "Choose location, people and urgency", sf::Color(244, 174, 68)},
+        {765.0f, 292.0f, 230.0f, 40.0f, "Dispatch next request", "Emergency requests are prioritized", sf::Color(226, 111, 102)},
+        {765.0f, 338.0f, 230.0f, 40.0f, "Add location", "Register a new village", sf::Color(123, 113, 226)},
+        {765.0f, 384.0f, 230.0f, 40.0f, "Add shelter", "Register beds in a region", sf::Color(42, 178, 155)}
     };
-    const float tabX[] = {378.0f, 582.0f, 786.0f};
-    const float tabWidth = 190.0f;
+    const float tabX[] = {410.0f, 590.0f, 770.0f};
+    const float tabWidth = 160.0f;
     const float tabY = 18.0f;
     const float tabHeight = 40.0f;
 
@@ -326,11 +484,70 @@ int main() {
                     const std::size_t step = keyPressed->code == sf::Keyboard::Key::PageUp ? 7 : 1;
                     routeScrollOffset = routeScrollOffset > step ? routeScrollOffset - step : 0;
                 } else if (keyPressed->code == sf::Keyboard::Key::Backspace) {
-                    std::string &input = dialogMode == DialogMode::AddLocation
-                        ? locationNameInput : requestPeopleInput;
-                    if ((dialogMode == DialogMode::AddLocation || dialogMode == DialogMode::AddRequest) &&
-                        !input.empty()) {
-                        input.pop_back();
+                    std::string *input = NULL;
+                    if (dialogMode == DialogMode::AddLocation) {
+                        input = &locationNameInput;
+                    } else if (dialogMode == DialogMode::AddRequest) {
+                        input = &requestPeopleInput;
+                    } else if (dialogMode == DialogMode::AddShelter) {
+                        input = shelterInputFocus == 0
+                            ? &shelterNameInput : &shelterCapacityInput;
+                    } else if (dialogMode == DialogMode::LookupRequest ||
+                               dialogMode == DialogMode::ReleaseShelter) {
+                        input = &requestLookupInput;
+                    }
+                    if (input != NULL && !input->empty()) {
+                        input->pop_back();
+                    }
+                } else if (keyPressed->code == sf::Keyboard::Key::Enter &&
+                           dialogMode == DialogMode::AddShelter) {
+                    const std::string name = trim(shelterNameInput);
+                    if (name.empty() || shelterCapacityInput.empty() ||
+                        locationCount == 0 || std::stoi(shelterCapacityInput) <= 0) {
+                        bfsResultText = "Enter a shelter name and positive capacity.";
+                        bfsResultColor = sf::Color(190, 68, 68);
+                    } else if (shelterTracker.addShelter(
+                                   name, locationNames[shelterRegionSelection],
+                                   std::stoi(shelterCapacityInput))) {
+                        bfsResultText = "Shelter " + name + " added in " +
+                            locationNames[shelterRegionSelection] + ".";
+                        bfsResultColor = sf::Color(34, 139, 98);
+                        dialogMode = DialogMode::None;
+                    } else {
+                        bfsResultText = "Shelter name is already in use.";
+                        bfsResultColor = sf::Color(190, 68, 68);
+                    }
+                } else if (keyPressed->code == sf::Keyboard::Key::Enter &&
+                           dialogMode == DialogMode::LookupRequest) {
+                    lookupPendingRequest();
+                    currentTab = 2;
+                    dialogMode = DialogMode::None;
+                } else if (keyPressed->code == sf::Keyboard::Key::Enter &&
+                           dialogMode == DialogMode::ReleaseShelter) {
+                    int requestId = 0;
+                    if (parseRequestId(requestLookupInput, requestId) &&
+                        shelterTracker.release(requestId)) {
+                        bfsResultText = "Released shelter allocation for request #" +
+                            std::to_string(requestId) + ".";
+                        bfsResultColor = sf::Color(34, 139, 98);
+                    } else {
+                        bfsResultText =
+                            "No shelter allocation found for that request ID.";
+                        bfsResultColor = sf::Color(190, 68, 68);
+                    }
+                    currentTab = 3;
+                    dialogMode = DialogMode::None;
+                } else if (keyPressed->code == sf::Keyboard::Key::Enter &&
+                           dialogMode == DialogMode::ConnectRegions) {
+                    if (locationCount > 1 &&
+                        roadSourceSelection != roadDestinationSelection) {
+                        road[roadSourceSelection][roadDestinationSelection] = 1;
+                        road[roadDestinationSelection][roadSourceSelection] = 1;
+                        bfsResultText = "Shelters connected: " +
+                            locationNames[roadSourceSelection] + " <-> " +
+                            locationNames[roadDestinationSelection] + ".";
+                        bfsResultColor = sf::Color(34, 139, 98);
+                        dialogMode = DialogMode::None;
                     }
                 } else if (keyPressed->code == sf::Keyboard::Key::Enter &&
                            dialogMode == DialogMode::AddLocation) {
@@ -351,16 +568,18 @@ int main() {
                         bfsResultText = "Enter a positive affected-person count.";
                         bfsResultColor = sf::Color(190, 68, 68);
                     } else {
-                        int newId = 101;
-                        for (const auto &request : activeRequests) {
-                            newId = std::max(newId, request.id + 1);
+                        int newId = 0;
+                        if (addReliefRequest(locationNames[requestLocationSelection],
+                                             std::stoi(requestPeopleInput),
+                                             requestPrioritySelection, newId)) {
+                            bfsResultText = "Request #" + std::to_string(newId) + " created.";
+                            bfsResultColor = sf::Color(39, 126, 177);
+                            currentTab = 2;
+                            dialogMode = DialogMode::None;
+                        } else {
+                            bfsResultText = "Could not create the relief request.";
+                            bfsResultColor = sf::Color(190, 68, 68);
                         }
-                        activeRequests.push_back({newId, locationNames[requestLocationSelection],
-                                                  std::stoi(requestPeopleInput), requestPrioritySelection});
-                        bfsResultText = "Request #" + std::to_string(newId) + " created.";
-                        bfsResultColor = sf::Color(39, 126, 177);
-                        currentTab = 2;
-                        dialogMode = DialogMode::None;
                     }
                 }
                 continue;
@@ -375,6 +594,19 @@ int main() {
                            textEntered->unicode >= '0' && textEntered->unicode <= '9' &&
                            requestPeopleInput.size() < 7) {
                     requestPeopleInput += static_cast<char>(textEntered->unicode);
+                } else if (dialogMode == DialogMode::AddShelter &&
+                           shelterInputFocus == 1 &&
+                           textEntered->unicode >= '0' && textEntered->unicode <= '9' &&
+                           shelterCapacityInput.size() < 7) {
+                    shelterCapacityInput += static_cast<char>(textEntered->unicode);
+                } else if (dialogMode == DialogMode::AddShelter &&
+                           shelterInputFocus == 0 && shelterNameInput.size() < 32) {
+                    shelterNameInput += static_cast<char>(textEntered->unicode);
+                } else if ((dialogMode == DialogMode::LookupRequest ||
+                            dialogMode == DialogMode::ReleaseShelter) &&
+                           textEntered->unicode >= '0' && textEntered->unicode <= '9' &&
+                           requestLookupInput.size() < 10) {
+                    requestLookupInput += static_cast<char>(textEntered->unicode);
                 }
                 continue;
             }
@@ -383,6 +615,126 @@ int main() {
                 mouseButton && mouseButton->button == sf::Mouse::Button::Left) {
                 sf::Vector2f mouse(static_cast<float>(mouseButton->position.x),
                                    static_cast<float>(mouseButton->position.y));
+
+                if (dialogMode == DialogMode::AddShelter) {
+                    if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                        mouse.y >= 280.0f && mouse.y <= 324.0f) {
+                        shelterInputFocus = 0;
+                    } else if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                               mouse.y >= 338.0f && mouse.y <= 382.0f &&
+                               locationCount > 0) {
+                        shelterRegionSelection =
+                            (shelterRegionSelection + 1) % locationCount;
+                    } else if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                               mouse.y >= 396.0f && mouse.y <= 440.0f) {
+                        shelterInputFocus = 1;
+                    } else if (mouse.x >= 545.0f && mouse.x <= 645.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        const std::string name = trim(shelterNameInput);
+                        if (name.empty() || shelterCapacityInput.empty() ||
+                            locationCount == 0 ||
+                            std::stoi(shelterCapacityInput) <= 0) {
+                            bfsResultText =
+                                "Enter a shelter name and positive capacity.";
+                            bfsResultColor = sf::Color(190, 68, 68);
+                        } else if (shelterTracker.addShelter(
+                                       name, locationNames[shelterRegionSelection],
+                                       std::stoi(shelterCapacityInput))) {
+                            bfsResultText = "Shelter " + name + " added in " +
+                                locationNames[shelterRegionSelection] + ".";
+                            bfsResultColor = sf::Color(34, 139, 98);
+                            dialogMode = DialogMode::None;
+                        } else {
+                            bfsResultText = "Shelter name is already in use.";
+                            bfsResultColor = sf::Color(190, 68, 68);
+                        }
+                    } else if (mouse.x >= 660.0f && mouse.x <= 760.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        dialogMode = DialogMode::None;
+                    }
+                    continue;
+                }
+
+                if (dialogMode == DialogMode::ConnectRegions) {
+                    if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                        mouse.y >= 280.0f && mouse.y <= 324.0f &&
+                        locationCount > 1) {
+                        roadSourceSelection =
+                            (roadSourceSelection + 1) % locationCount;
+                        if (roadSourceSelection == roadDestinationSelection) {
+                            roadSourceSelection =
+                                (roadSourceSelection + 1) % locationCount;
+                        }
+                    } else if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                               mouse.y >= 338.0f && mouse.y <= 382.0f &&
+                               locationCount > 1) {
+                        roadDestinationSelection =
+                            (roadDestinationSelection + 1) % locationCount;
+                        if (roadDestinationSelection == roadSourceSelection) {
+                            roadDestinationSelection =
+                                (roadDestinationSelection + 1) % locationCount;
+                        }
+                    } else if (mouse.x >= 545.0f && mouse.x <= 645.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        if (locationCount > 1 &&
+                            roadSourceSelection != roadDestinationSelection) {
+                            road[roadSourceSelection][roadDestinationSelection] = 1;
+                            road[roadDestinationSelection][roadSourceSelection] = 1;
+                            bfsResultText = "Shelters connected: " +
+                                locationNames[roadSourceSelection] + " <-> " +
+                                locationNames[roadDestinationSelection] + ".";
+                            bfsResultColor = sf::Color(34, 139, 98);
+                            dialogMode = DialogMode::None;
+                        }
+                    } else if (mouse.x >= 660.0f && mouse.x <= 760.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        dialogMode = DialogMode::None;
+                    }
+                    continue;
+                }
+
+                if (dialogMode == DialogMode::LookupRequest) {
+                    if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                        mouse.y >= 280.0f && mouse.y <= 324.0f) {
+                        requestLookupInput.clear();
+                    } else if (mouse.x >= 545.0f && mouse.x <= 645.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        lookupPendingRequest();
+                        currentTab = 2;
+                        dialogMode = DialogMode::None;
+                    } else if (mouse.x >= 660.0f && mouse.x <= 760.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        dialogMode = DialogMode::None;
+                    }
+                    continue;
+                }
+
+                if (dialogMode == DialogMode::ReleaseShelter) {
+                    if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
+                        mouse.y >= 280.0f && mouse.y <= 324.0f) {
+                        requestLookupInput.clear();
+                    } else if (mouse.x >= 545.0f && mouse.x <= 645.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        int requestId = 0;
+                        if (parseRequestId(requestLookupInput, requestId) &&
+                            shelterTracker.release(requestId)) {
+                            bfsResultText =
+                                "Released shelter allocation for request #" +
+                                std::to_string(requestId) + ".";
+                            bfsResultColor = sf::Color(34, 139, 98);
+                        } else {
+                            bfsResultText =
+                                "No shelter allocation found for that request ID.";
+                            bfsResultColor = sf::Color(190, 68, 68);
+                        }
+                        currentTab = 3;
+                        dialogMode = DialogMode::None;
+                    } else if (mouse.x >= 660.0f && mouse.x <= 760.0f &&
+                               mouse.y >= 456.0f && mouse.y <= 498.0f) {
+                        dialogMode = DialogMode::None;
+                    }
+                    continue;
+                }
 
                 if (dialogMode == DialogMode::AddLocation) {
                     if (mouse.x >= 545.0f && mouse.x <= 645.0f &&
@@ -480,6 +832,14 @@ int main() {
                     continue;
                 }
 
+                if (currentTab == 2 && dialogMode == DialogMode::None &&
+                    mouse.x >= 520.0f && mouse.x <= 710.0f &&
+                    mouse.y >= 212.0f && mouse.y <= 258.0f) {
+                    requestLookupInput.clear();
+                    dialogMode = DialogMode::LookupRequest;
+                    continue;
+                }
+
                 if (dialogMode == DialogMode::AddRequest) {
                     if (mouse.x >= 315.0f && mouse.x <= 725.0f &&
                         mouse.y >= 280.0f && mouse.y <= 324.0f && locationCount > 0) {
@@ -489,19 +849,23 @@ int main() {
                         requestPrioritySelection = mouse.x < 520.0f ? 1 : 0;
                     } else if (mouse.x >= 545.0f && mouse.x <= 645.0f &&
                                mouse.y >= 456.0f && mouse.y <= 498.0f) {
-                        if (requestPeopleInput.empty() || std::stoi(requestPeopleInput) <= 0) {
+                        if (requestPeopleInput.empty() || std::stoi(requestPeopleInput) <= 0 ||
+                            locationCount == 0) {
                             bfsResultText = "Enter a positive affected-person count.";
                             bfsResultColor = sf::Color(190, 68, 68);
                         } else {
-                            int newId = 101;
-                            for (const auto &request : activeRequests)
-                                newId = std::max(newId, request.id + 1);
-                            activeRequests.push_back({newId, locationNames[requestLocationSelection],
-                                                      std::stoi(requestPeopleInput), requestPrioritySelection});
-                            bfsResultText = "Request #" + std::to_string(newId) + " created.";
-                            bfsResultColor = sf::Color(39, 126, 177);
-                            currentTab = 2;
-                            dialogMode = DialogMode::None;
+                            int newId = 0;
+                            if (addReliefRequest(locationNames[requestLocationSelection],
+                                                 std::stoi(requestPeopleInput),
+                                                 requestPrioritySelection, newId)) {
+                                bfsResultText = "Request #" + std::to_string(newId) + " created.";
+                                bfsResultColor = sf::Color(39, 126, 177);
+                                currentTab = 2;
+                                dialogMode = DialogMode::None;
+                            } else {
+                                bfsResultText = "Could not create the relief request.";
+                                bfsResultColor = sf::Color(190, 68, 68);
+                            }
                         }
                     } else if (mouse.x >= 660.0f && mouse.x <= 760.0f &&
                                mouse.y >= 456.0f && mouse.y <= 498.0f) {
@@ -546,13 +910,20 @@ int main() {
                     dialogMode = DialogMode::AddRequest;
                 }
 
-                if (contains(actionButtons[3], mouse) && !activeRequests.empty()) {
-                    const auto nextRequest = std::find_if(activeRequests.begin(), activeRequests.end(),
-                        [](const VisualRequest &request) { return request.priority == 1; });
-                    const auto dispatch = nextRequest == activeRequests.end() ? activeRequests.begin() : nextRequest;
-                    bfsResultText = "Request dispatched.\nRequest #" + std::to_string(dispatch->id);
-                    activeRequests.erase(dispatch);
-                    bfsResultColor = sf::Color(169, 119, 30);
+                if (contains(actionButtons[3], mouse) && !activeRequests.isEmpty()) {
+                    if (dispatchNextRequest(bfsResultText)) {
+                        bfsResultColor = sf::Color(169, 119, 30);
+                    } else {
+                        bfsResultColor = sf::Color(190, 68, 68);
+                    }
+                }
+
+                if (contains(actionButtons[5], mouse) && locationCount > 0) {
+                    shelterNameInput.clear();
+                    shelterCapacityInput.clear();
+                    shelterRegionSelection = 0;
+                    shelterInputFocus = 0;
+                    dialogMode = DialogMode::AddShelter;
                 }
             }
         }
@@ -569,7 +940,9 @@ int main() {
         topAccent.setFillColor(sf::Color(52, 190, 190));
         window.draw(topAccent);
 
-        const std::string tabs[] = {"Road network", "Location tree", "Relief queue"};
+        const std::string tabs[] = {
+            "Road network", "Location tree", "Relief queue"
+        };
         for (int i = 0; i < 3; ++i) {
             const sf::Vector2f mousePosition = static_cast<sf::Vector2f>(sf::Mouse::getPosition(window));
             const bool hovered = mousePosition.x >= tabX[i] && mousePosition.x <= tabX[i] + tabWidth &&
@@ -617,11 +990,14 @@ int main() {
                 else if (road[i][j] == 2) ++blockedRoads;
             }
         }
-        for (const auto &request : activeRequests)
+        const std::vector<ReliefRequest> currentRequests = activeRequests.getAll();
+        for (const auto &request : currentRequests)
             if (request.priority == 1) ++emergencyRequests;
 
         if (fontLoaded) {
-            const std::string titles[] = {"Road network", "Location hierarchy", "Relief requests"};
+            const std::string titles[] = {
+                "Road network", "Location hierarchy", "Relief requests"
+            };
             const std::string descriptions[] = {
                 "See how road closures change access between communities.",
                 "Explore the district, village and area structure.",
@@ -669,17 +1045,18 @@ int main() {
 
         const sf::Vector2f mousePosition = static_cast<sf::Vector2f>(sf::Mouse::getPosition(window));
         const bool mouseDown = sf::Mouse::isButtonPressed(sf::Mouse::Button::Left);
-        for (int i = 0; i < 5; ++i) {
-            const bool enabled = (i != 3 || !activeRequests.empty()) &&
+        for (int i = 0; i < 6; ++i) {
+            const bool enabled = (i != 3 || !activeRequests.isEmpty()) &&
                                  (i != 4 || locationCount < 50) &&
                                  (i != 0 || locationCount > 1) &&
-                                 (i != 2 || locationCount > 0);
+                                 (i != 2 || locationCount > 0) &&
+                                 (i != 5 || locationCount > 0);
             drawControlButton(window, font, fontLoaded, actionButtons[i], mousePosition,
                               mouseDown && contains(actionButtons[i], mousePosition), enabled);
         }
 
         sf::RectangleShape statusBox({230.0f, 76.0f});
-        statusBox.setPosition({765.0f, 440.0f});
+        statusBox.setPosition({765.0f, 478.0f});
         statusBox.setFillColor(sf::Color(30, 58, 84));
         statusBox.setOutlineThickness(1);
         statusBox.setOutlineColor(sf::Color(58, 88, 114));
@@ -687,12 +1064,12 @@ int main() {
 
         if (fontLoaded) {
             sf::Text statusTitle(font, "LATEST UPDATE", 9);
-            statusTitle.setPosition({777.0f, 449.0f});
+            statusTitle.setPosition({777.0f, 486.0f});
             statusTitle.setFillColor(sf::Color(157, 187, 208));
             window.draw(statusTitle);
 
             sf::Text statusContent(font, bfsResultText, 10);
-            statusContent.setPosition({777.0f, 472.0f});
+            statusContent.setPosition({777.0f, 507.0f});
             statusContent.setFillColor(bfsResultColor);
             window.draw(statusContent);
         }
@@ -700,7 +1077,7 @@ int main() {
         if (fontLoaded) {
             sf::Text conceptTitle(font, "WHAT THIS DEMO SHOWS", 9);
             conceptTitle.setStyle(sf::Text::Bold);
-            conceptTitle.setPosition({770.0f, 535.0f});
+            conceptTitle.setPosition({770.0f, 560.0f});
             conceptTitle.setFillColor(sf::Color(181, 204, 220));
             window.draw(conceptTitle);
 
@@ -711,10 +1088,16 @@ int main() {
             };
             for (int i = 0; i < 3; ++i) {
                 sf::Text conceptText(font, conceptLines[i], 10);
-                conceptText.setPosition({770.0f, 559.0f + static_cast<float>(i) * 24.0f});
+                conceptText.setPosition({770.0f, 580.0f + static_cast<float>(i) * 18.0f});
                 conceptText.setFillColor(sf::Color(147, 174, 195));
                 window.draw(conceptText);
             }
+            sf::Text capacityText(font,
+                "Shelter beds available: " + std::to_string(shelterTracker.totalAvailable()),
+                9);
+            capacityText.setPosition({770.0f, 637.0f});
+            capacityText.setFillColor(sf::Color(147, 205, 190));
+            window.draw(capacityText);
         }
 
         sf::RectangleShape workspaceCard({710.0f, 450.0f});
@@ -770,9 +1153,21 @@ int main() {
                 }
             }
 
+            const std::vector<ShelterCapacity> graphShelters =
+                shelterTracker.getShelters();
             for (int i = 0; i < locationCount; ++i) {
                 const float nodeRadius = locationCount > 20 ? 10.0f :
                                          locationCount > 12 ? 16.0f : 23.0f;
+                int shelterCount = 0;
+                int totalCapacity = 0;
+                for (std::size_t shelterIndex = 0;
+                     shelterIndex < graphShelters.size(); ++shelterIndex) {
+                    if (graphShelters[shelterIndex].region == locationNames[i]) {
+                        ++shelterCount;
+                        totalCapacity += graphShelters[shelterIndex].capacity;
+                    }
+                }
+
                 sf::CircleShape circle(nodeRadius);
                 circle.setOrigin({nodeRadius, nodeRadius});
                 circle.setPosition(nodePositions[i]);
@@ -781,8 +1176,10 @@ int main() {
                     sf::Color(130, 103, 215), sf::Color(232, 156, 67)
                 };
                 circle.setFillColor(nodeColors[i % 4]);
-                circle.setOutlineThickness(2.0f);
-                circle.setOutlineColor(sf::Color(255, 255, 255));
+                circle.setOutlineThickness(shelterCount > 0 ? 4.0f : 2.0f);
+                circle.setOutlineColor(shelterCount > 0
+                    ? sf::Color(48, 158, 116)
+                    : sf::Color(255, 255, 255));
                 window.draw(circle);
 
                 if (fontLoaded) {
@@ -794,6 +1191,22 @@ int main() {
                     lbl.setOrigin({lbl.getLocalBounds().size.x / 2.0f, 0.0f});
                     lbl.setPosition({nodePositions[i].x, nodePositions[i].y + nodeRadius + 3.0f});
                     window.draw(lbl);
+
+                    const std::string shelterLabel = shelterCount > 0
+                        ? std::to_string(shelterCount) +
+                            (shelterCount == 1 ? " shelter (" : " shelters (") +
+                            std::to_string(totalCapacity) + " beds)"
+                        : "No shelter";
+                    sf::Text shelterText(font, shelterLabel,
+                                         labelSize > 10 ? 9 : labelSize > 8 ? 8 : 7);
+                    shelterText.setOrigin(
+                        {shelterText.getLocalBounds().size.x / 2.0f, 0.0f});
+                    shelterText.setPosition({nodePositions[i].x,
+                        nodePositions[i].y + nodeRadius + 3.0f + labelSize + 1.0f});
+                    shelterText.setFillColor(shelterCount > 0
+                        ? sf::Color(39, 125, 91)
+                        : sf::Color(92, 118, 139));
+                    window.draw(shelterText);
 
                     sf::Text idText(font, std::to_string(i), locationCount > 20 ? 8 : 11);
                     idText.setOrigin({idText.getLocalBounds().size.x / 2.0f,
@@ -897,15 +1310,33 @@ int main() {
 
         } else if (currentTab == 2) {
             // ================= RELIEF REQUESTS VIEW =================
+            const UiButton requestLookupButton = {
+                520.0f, 212.0f, 190.0f, 46.0f, "Look up request ID",
+                "Search pending requests", sf::Color(72, 163, 183)
+            };
+            const sf::Vector2f requestMousePosition =
+                static_cast<sf::Vector2f>(sf::Mouse::getPosition(window));
+            const bool requestMouseDown =
+                sf::Mouse::isButtonPressed(sf::Mouse::Button::Left);
+            drawControlButton(window, font, fontLoaded, requestLookupButton,
+                requestMousePosition,
+                requestMouseDown &&
+                    contains(requestLookupButton, requestMousePosition),
+                true);
+
             if (fontLoaded) {
-                std::vector<VisualRequest> orderedRequests = activeRequests;
+                std::vector<ReliefRequest> orderedRequests = currentRequests;
                 std::stable_sort(orderedRequests.begin(), orderedRequests.end(),
-                    [](const VisualRequest &left, const VisualRequest &right) {
+                    [](const ReliefRequest &left, const ReliefRequest &right) {
                         return left.priority > right.priority;
                     });
 
-                float cardY = 212.0f;
-                for (const auto &req : orderedRequests) {
+                float cardY = 270.0f;
+                const std::size_t visibleRequestCount =
+                    std::min<std::size_t>(orderedRequests.size(), 5);
+                for (std::size_t requestIndex = 0;
+                     requestIndex < visibleRequestCount; ++requestIndex) {
+                    const ReliefRequest &req = orderedRequests[requestIndex];
                     sf::RectangleShape card({680.0f, 50.0f});
                     card.setPosition({30.0f, cardY});
                     card.setFillColor(sf::Color(255, 255, 255));
@@ -936,10 +1367,56 @@ int main() {
 
                 if (orderedRequests.empty()) {
                     sf::Text emptyMessage(font, "No active requests. Add an emergency from the live demo panel.", 12);
-                    emptyMessage.setPosition({40.0f, 220.0f});
+                    emptyMessage.setPosition({40.0f, 280.0f});
                     emptyMessage.setFillColor(sf::Color(91, 117, 139));
                     window.draw(emptyMessage);
+                    cardY = 255.0f;
+                } else if (orderedRequests.size() > visibleRequestCount) {
+                    sf::Text remainingMessage(font,
+                        std::to_string(orderedRequests.size() - visibleRequestCount) +
+                        " additional active request(s) are queued.",
+                        10);
+                    remainingMessage.setPosition({40.0f, cardY});
+                    remainingMessage.setFillColor(sf::Color(91, 117, 139));
+                    window.draw(remainingMessage);
+                    cardY += 25.0f;
                 }
+
+                const std::vector<OperationRecord> recentOperations = operationHistory.getAll();
+                if (!recentOperations.empty() && cardY + 36.0f < 640.0f) {
+                    sf::Text historyTitle(font, "PROCESSED OPERATIONS  (newest first)", 10);
+                    historyTitle.setStyle(sf::Text::Bold);
+                    historyTitle.setPosition({40.0f, cardY + 3.0f});
+                    historyTitle.setFillColor(sf::Color(54, 91, 112));
+                    window.draw(historyTitle);
+
+                    const std::size_t historyRows = std::min<std::size_t>(
+                        recentOperations.size(),
+                        static_cast<std::size_t>((632.0f - cardY - 25.0f) / 25.0f));
+                    for (std::size_t i = 0; i < historyRows; ++i) {
+                        const OperationRecord &operation = recentOperations[i];
+                        std::string shelterSummary;
+                        for (std::size_t j = 0;
+                             j < operation.assignments.size() && j < 2; ++j) {
+                            if (!shelterSummary.empty()) shelterSummary += ", ";
+                            shelterSummary += operation.assignments[j].shelterName +
+                                " " + std::to_string(operation.assignments[j].evacuees);
+                        }
+                        if (operation.assignments.size() > 2) shelterSummary += ", ...";
+
+                        sf::Text historyRow(font,
+                            "#" + std::to_string(operation.requestId) + "  " +
+                            operation.village + "  |  " +
+                            std::to_string(operation.people) + " evacuees  |  " +
+                            shelterSummary,
+                            10);
+                        historyRow.setPosition({48.0f, cardY + 24.0f +
+                                                 static_cast<float>(i) * 25.0f});
+                        historyRow.setFillColor(sf::Color(73, 99, 117));
+                        window.draw(historyRow);
+                    }
+                }
+
             }
         }
 
@@ -964,15 +1441,16 @@ int main() {
             window.draw(dialogHeader);
 
             if (fontLoaded) {
-                const std::string titleText = dialogMode == DialogMode::AddLocation
-                    ? "Register a location"
-                    : dialogMode == DialogMode::ManageRoad
-                        ? "Road connection manager"
-                        : dialogMode == DialogMode::CheckRoute
-                            ? "Find an open-road route"
-                            : dialogMode == DialogMode::ShowRoute
-                                ? "BFS route result"
-                                : "Create a relief request";
+                const std::string titleText =
+                    dialogMode == DialogMode::AddLocation ? "Register a location" :
+                    dialogMode == DialogMode::ManageRoad ? "Road connection manager" :
+                    dialogMode == DialogMode::CheckRoute ? "Find an open-road route" :
+                    dialogMode == DialogMode::ShowRoute ? "BFS route result" :
+                    dialogMode == DialogMode::AddShelter ? "Register a shelter" :
+                    dialogMode == DialogMode::ConnectRegions ? "Connect shelter regions" :
+                    dialogMode == DialogMode::LookupRequest ? "Look up a request" :
+                    dialogMode == DialogMode::ReleaseShelter ? "Release shelter capacity" :
+                    "Create a relief request";
                 sf::Text title(font, titleText, 19);
                 title.setStyle(sf::Text::Bold);
                 title.setPosition({284.0f, compactDialog ? 226.0f : 186.0f});
@@ -995,6 +1473,29 @@ int main() {
                                      sf::Color(89, 108, 211));
                     drawDialogButton(window, font, "Cancel", 660.0f, 400.0f,
                                      sf::Color(112, 130, 150));
+                } else if (dialogMode == DialogMode::AddShelter &&
+                           locationCount > 0) {
+                    sf::Text prompt(font,
+                        "Register shelter beds at a region in the location network.",
+                        11);
+                    prompt.setPosition({315.0f, 235.0f});
+                    prompt.setFillColor(sf::Color(92, 111, 132));
+                    window.draw(prompt);
+
+                    drawDialogField(window, font, "SHELTER NAME  (CLICK, THEN TYPE)",
+                        shelterNameInput + (shelterInputFocus == 0 ? "_" : ""),
+                        280.0f, sf::Color(42, 178, 155));
+                    drawDialogField(window, font, "REGION  (CLICK TO CHANGE)",
+                        locationNames[shelterRegionSelection], 338.0f,
+                        sf::Color(71, 150, 224));
+                    drawDialogField(window, font, "BED CAPACITY  (CLICK, THEN TYPE)",
+                        shelterCapacityInput +
+                            (shelterInputFocus == 1 ? "_" : ""),
+                        396.0f, sf::Color(244, 174, 68));
+                    drawDialogButton(window, font, "Create", 545.0f, 456.0f,
+                                     sf::Color(37, 155, 137));
+                    drawDialogButton(window, font, "Cancel", 660.0f, 456.0f,
+                                     sf::Color(112, 130, 150));
                 } else if (dialogMode == DialogMode::ManageRoad && locationCount > 1) {
                     sf::Text prompt(font, "Select any two locations, then choose their road status.", 11);
                     prompt.setPosition({315.0f, 235.0f});
@@ -1016,6 +1517,52 @@ int main() {
                                     statuses[roadStatusSelection], 396.0f,
                                     statusColors[roadStatusSelection]);
                     drawDialogButton(window, font, "Apply", 545.0f, 456.0f,
+                                     sf::Color(37, 155, 137));
+                    drawDialogButton(window, font, "Cancel", 660.0f, 456.0f,
+                                     sf::Color(112, 130, 150));
+                } else if (dialogMode == DialogMode::ConnectRegions &&
+                           locationCount > 1) {
+                    sf::Text prompt(font,
+                        "Open a two-way road so evacuees can reach shelters in either region.",
+                        11);
+                    prompt.setPosition({315.0f, 235.0f});
+                    prompt.setFillColor(sf::Color(92, 111, 132));
+                    window.draw(prompt);
+                    drawDialogField(window, font, "FROM REGION  (CLICK TO CHANGE)",
+                        locationNames[roadSourceSelection], 280.0f,
+                        sf::Color(71, 150, 224));
+                    drawDialogField(window, font, "TO REGION  (CLICK TO CHANGE)",
+                        locationNames[roadDestinationSelection], 338.0f,
+                        sf::Color(42, 178, 155));
+                    drawDialogButton(window, font, "Connect", 545.0f, 456.0f,
+                                     sf::Color(37, 155, 137));
+                    drawDialogButton(window, font, "Cancel", 660.0f, 456.0f,
+                                     sf::Color(112, 130, 150));
+                } else if (dialogMode == DialogMode::LookupRequest) {
+                    sf::Text prompt(font,
+                        "Search the pending-request hash table by request ID.",
+                        11);
+                    prompt.setPosition({315.0f, 235.0f});
+                    prompt.setFillColor(sf::Color(92, 111, 132));
+                    window.draw(prompt);
+                    drawDialogField(window, font, "REQUEST ID  (TYPE A NUMBER)",
+                        requestLookupInput + "_", 280.0f,
+                        sf::Color(72, 163, 183));
+                    drawDialogButton(window, font, "Search", 545.0f, 456.0f,
+                                     sf::Color(37, 155, 137));
+                    drawDialogButton(window, font, "Cancel", 660.0f, 456.0f,
+                                     sf::Color(112, 130, 150));
+                } else if (dialogMode == DialogMode::ReleaseShelter) {
+                    sf::Text prompt(font,
+                        "Release all beds allocated to a processed request.",
+                        11);
+                    prompt.setPosition({315.0f, 235.0f});
+                    prompt.setFillColor(sf::Color(92, 111, 132));
+                    window.draw(prompt);
+                    drawDialogField(window, font, "PROCESSED REQUEST ID",
+                        requestLookupInput + "_", 280.0f,
+                        sf::Color(123, 113, 226));
+                    drawDialogButton(window, font, "Release", 545.0f, 456.0f,
                                      sf::Color(37, 155, 137));
                     drawDialogButton(window, font, "Cancel", 660.0f, 456.0f,
                                      sf::Color(112, 130, 150));
@@ -1138,3 +1685,47 @@ int main() {
 
     return 0;
 }
+
+#else
+
+#include <iostream>
+
+#include "LocationManagement.h"
+#include "RequestManagement.h"
+
+int main()
+{
+    int choice = 0;
+    do
+    {
+        std::cout << "\nFloodOps Console\n"
+                  << "1. Location and road management\n"
+                  << "2. Relief request management\n"
+                  << "3. Exit\n"
+                  << "Choice: ";
+
+        if (!(std::cin >> choice))
+        {
+            std::cerr << "\nInvalid input. Exiting.\n";
+            return 1;
+        }
+
+        switch (choice)
+        {
+            case 1:
+                locationMenu();
+                break;
+            case 2:
+                requestMenu();
+                break;
+            case 3:
+                break;
+            default:
+                std::cout << "Choose 1, 2, or 3.\n";
+        }
+    } while (choice != 3);
+
+    return 0;
+}
+
+#endif
